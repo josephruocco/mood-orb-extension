@@ -1,0 +1,33 @@
+# OS / editor
+.DS_Store
+.AppleDouble
+.LSOverride
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Node (if you add a build step later)
+node_modules/
+dist/
+build/
+.parcel-cache/
+.cache/
+.eslintcache
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Extension build artifacts (common)
+*.crx
+*.xpi
+web-ext-artifacts/

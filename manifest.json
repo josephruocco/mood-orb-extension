@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Mood Orb",
+  "version": "0.1.0",
+  "description": "A mood-ring orb that estimates your vibe from browsing patterns (local-only).",
+  "permissions": ["tabs", "history", "storage", "alarms"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "service_worker.js" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content_script.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
