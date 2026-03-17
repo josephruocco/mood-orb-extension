@@ -21,13 +21,13 @@ const MOOD_COLORS = {
 
 chrome.runtime.onInstalled.addListener(async () => {
   await chrome.storage.local.set({ moodState: DEFAULT_STATE });
-  chrome.alarms.create("mood_tick", { periodInMinutes: 1 });
+  ensureMoodAlarm();
   // Run once immediately.
   computeAndBroadcastMood().catch(() => {});
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  chrome.alarms.create("mood_tick", { periodInMinutes: 1 });
+  ensureMoodAlarm();
   computeAndBroadcastMood().catch(() => {});
 });
 
@@ -47,49 +47,17 @@ async function computeAndBroadcastMood() {
   const sinceMs = now - windowMinutes * 60 * 1000;
   const { moodState: previousState } = await chrome.storage.local.get(["moodState"]);
 
-  // 1) Tabs snapshot
   const tabs = await chrome.tabs.query({});
   const openSnapshot = summarizeOpenTabs(tabs);
-
-  // 2) History (last 30 min, cap 200)
   const historyItems = await chrome.history.search({
     text: "",
     startTime: sinceMs,
     maxResults: 200
   });
-
   const historySnapshot = extractHistorySignals(historyItems);
-
-  // 3) Simple heuristic features
-  const features = {
-    windowMinutes,
-    openTabCount: openSnapshot.openTabCount,
-    openDomainCount: openSnapshot.openDomainCount,
-    activeCategory: openSnapshot.activeCategory,
-    visitCount: historySnapshot.visitCount,
-    uniqueDomainVisitedCount: historySnapshot.uniqueDomainVisitedCount,
-    searchCount: historySnapshot.searchQueries.length,
-    topDomain: historySnapshot.topDomain,
-    categoryCounts: historySnapshot.categoryCounts,
-    openCategoryCounts: openSnapshot.openCategoryCounts,
-    focusSearchCount: countSearches(historySnapshot.searchQueries, FOCUS_SEARCH_TERMS),
-    anxiousSearchCount: countSearches(historySnapshot.searchQueries, ANXIOUS_SEARCH_TERMS),
-    escapeSearchCount: countSearches(historySnapshot.searchQueries, ESCAPE_SEARCH_TERMS),
-    shoppingSearchCount: countSearches(historySnapshot.searchQueries, SHOPPING_SEARCH_TERMS)
-  };
-
-  // 4) Score moods
+  const features = buildFeatures(windowMinutes, openSnapshot, historySnapshot);
   const scored = scoreMoods(features, previousState);
-
-  // 5) Persist + broadcast
-  const moodState = {
-    mood: scored.mood,
-    confidence: scored.confidence,
-    color: MOOD_COLORS[scored.mood] || MOOD_COLORS.Neutral,
-    summary: scored.summary,
-    signals: scored.signals,
-    updatedAt: now
-  };
+  const moodState = buildMoodState(scored, now);
 
   await chrome.storage.local.set({ moodState });
   await broadcastToAllTabs({ type: "MOOD_UPDATE", payload: moodState });
@@ -106,6 +74,42 @@ async function broadcastToAllTabs(message) {
   }
 }
 
+function ensureMoodAlarm() {
+  chrome.alarms.create("mood_tick", { periodInMinutes: 1 });
+}
+
+function buildFeatures(windowMinutes, openSnapshot, historySnapshot) {
+  const { searchQueries } = historySnapshot;
+
+  return {
+    windowMinutes,
+    openTabCount: openSnapshot.openTabCount,
+    openDomainCount: openSnapshot.openDomainCount,
+    activeCategory: openSnapshot.activeCategory,
+    visitCount: historySnapshot.visitCount,
+    uniqueDomainVisitedCount: historySnapshot.uniqueDomainVisitedCount,
+    searchCount: searchQueries.length,
+    topDomain: historySnapshot.topDomain,
+    categoryCounts: historySnapshot.categoryCounts,
+    openCategoryCounts: openSnapshot.openCategoryCounts,
+    focusSearchCount: countSearches(searchQueries, FOCUS_SEARCH_TERMS),
+    anxiousSearchCount: countSearches(searchQueries, ANXIOUS_SEARCH_TERMS),
+    escapeSearchCount: countSearches(searchQueries, ESCAPE_SEARCH_TERMS),
+    shoppingSearchCount: countSearches(searchQueries, SHOPPING_SEARCH_TERMS)
+  };
+}
+
+function buildMoodState(scored, updatedAt) {
+  return {
+    mood: scored.mood,
+    confidence: scored.confidence,
+    color: MOOD_COLORS[scored.mood] || MOOD_COLORS.Neutral,
+    summary: scored.summary,
+    signals: scored.signals,
+    updatedAt
+  };
+}
+
 // --- Helpers: tabs/domains ---
 function summarizeOpenTabs(tabs) {
   const openDomains = {};
@@ -118,10 +122,10 @@ function summarizeOpenTabs(tabs) {
     const d = safeDomain(t.url);
     if (!d) continue;
     openTabCount += 1;
-    openDomains[d] = (openDomains[d] || 0) + 1;
+    incrementCount(openDomains, d);
 
     const category = classifyDomain(d);
-    openCategoryCounts[category] = (openCategoryCounts[category] || 0) + 1;
+    incrementCount(openCategoryCounts, category);
     if (t.active) activeCategory = category;
   }
 
@@ -145,9 +149,9 @@ function extractHistorySignals(items) {
 
     const d = safeDomain(it.url);
     if (d) {
-      domainsVisited[d] = (domainsVisited[d] || 0) + 1;
+      incrementCount(domainsVisited, d);
       const category = classifyDomain(d);
-      categoryCounts[category] = (categoryCounts[category] || 0) + 1;
+      incrementCount(categoryCounts, category);
     }
 
     const q = extractSearchQuery(it.url);
@@ -175,6 +179,10 @@ function safeDomain(url) {
   }
 }
 
+function incrementCount(map, key) {
+  map[key] = (map[key] || 0) + 1;
+}
+
 // Naive search query extraction from common engines.
 function extractSearchQuery(url) {
   try {
@@ -182,20 +190,8 @@ function extractSearchQuery(url) {
     const host = u.hostname.replace(/^www\./, "");
     const params = u.searchParams;
 
-    // Google / DuckDuckGo / Bing-ish
     const q = params.get("q") || params.get("p"); // p is Yahoo
-    if (!q) return null;
-
-    // Only treat as "search query" if it looks like a search engine.
-    const isSearchHost =
-      host.includes("google.") ||
-      host.includes("duckduckgo.") ||
-      host.includes("bing.com") ||
-      host.includes("search.yahoo.") ||
-      host.includes("ecosia.") ||
-      host.includes("brave.com");
-
-    if (!isSearchHost) return null;
+    if (!q || !isSearchHost(host)) return null;
 
     const cleaned = decodeURIComponent(q).trim();
     if (!cleaned) return null;
@@ -203,6 +199,17 @@ function extractSearchQuery(url) {
   } catch {
     return null;
   }
+}
+
+function isSearchHost(host) {
+  return (
+    host.includes("google.") ||
+    host.includes("duckduckgo.") ||
+    host.includes("bing.com") ||
+    host.includes("search.yahoo.") ||
+    host.includes("ecosia.") ||
+    host.includes("brave.com")
+  );
 }
 
 // --- Categorization (starter mapping) ---
@@ -297,7 +304,7 @@ function scoreMoods(f, previousState) {
       focusIntent * 0.5 +
       clamp01(1 - escapeIntent) * 0.18 +
       clamp01(1 - switchingLoad) * 0.16 +
-      (f.activeCategory === "docsdev" || f.activeCategory === "productivity" ? 0.12 : 0),
+      (isWorkCategory(f.activeCategory) ? 0.12 : 0),
     Calm:
       calmReserve * 0.5 +
       clamp01(1 - stimulationMix / 14) * 0.2 +
@@ -313,21 +320,16 @@ function scoreMoods(f, previousState) {
       clamp01(category("news") / 8) * 0.16 +
       clamp01(f.anxiousSearchCount / 4) * 0.16 +
       activityLevel * 0.1 +
-      (f.activeCategory === "wellness" || f.activeCategory === "news" ? 0.08 : 0),
+      (isHighAlertCategory(f.activeCategory) ? 0.08 : 0),
     Avoidant:
       escapeIntent * 0.48 +
       clamp01(category("shopping") / 6) * 0.12 +
       activityLevel * 0.14 +
       clamp01(1 - focusIntent) * 0.16 +
-      (f.activeCategory === "video" || f.activeCategory === "social" ? 0.1 : 0)
+      (isEscapeCategory(f.activeCategory) ? 0.1 : 0)
   };
 
-  if (previousState?.mood && scores[previousState.mood] != null) {
-    const freshnessBoost = Date.now() - (previousState.updatedAt || 0) < 90 * 60 * 1000 ? 0.08 : 0.04;
-    scores[previousState.mood] = clamp01(
-      scores[previousState.mood] + freshnessBoost * clamp01(previousState.confidence || 0.5)
-    );
-  }
+  applyPreviousMoodBias(scores, previousState);
 
   const candidates = Object.entries(scores)
     .map(([mood, score]) => ({ mood, score: clamp01(score) }))
@@ -360,6 +362,27 @@ function scoreMoods(f, previousState) {
   const signals = buildSignals(mood, f);
 
   return { mood, confidence, summary, signals };
+}
+
+function isWorkCategory(category) {
+  return category === "docsdev" || category === "productivity";
+}
+
+function isHighAlertCategory(category) {
+  return category === "wellness" || category === "news";
+}
+
+function isEscapeCategory(category) {
+  return category === "video" || category === "social";
+}
+
+function applyPreviousMoodBias(scores, previousState) {
+  if (!previousState?.mood || scores[previousState.mood] == null) return;
+
+  const freshnessBoost = Date.now() - (previousState.updatedAt || 0) < 90 * 60 * 1000 ? 0.08 : 0.04;
+  scores[previousState.mood] = clamp01(
+    scores[previousState.mood] + freshnessBoost * clamp01(previousState.confidence || 0.5)
+  );
 }
 
 function buildSignals(mood, f) {
