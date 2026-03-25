@@ -54,7 +54,7 @@ async function computeAndBroadcastMood() {
     startTime: sinceMs,
     maxResults: 200
   });
-  const historySnapshot = extractHistorySignals(historyItems);
+  const historySnapshot = extractHistorySignals(historyItems, now);
   const features = buildFeatures(windowMinutes, openSnapshot, historySnapshot);
   const scored = scoreMoods(features, previousState);
   const moodState = buildMoodState(scored, now);
@@ -87,10 +87,13 @@ function buildFeatures(windowMinutes, openSnapshot, historySnapshot) {
     openDomainCount: openSnapshot.openDomainCount,
     activeCategory: openSnapshot.activeCategory,
     visitCount: historySnapshot.visitCount,
+    recentVisitCount: historySnapshot.recentVisitCount,
+    coherenceRatio: historySnapshot.coherenceRatio,
     uniqueDomainVisitedCount: historySnapshot.uniqueDomainVisitedCount,
     searchCount: searchQueries.length,
     topDomain: historySnapshot.topDomain,
     categoryCounts: historySnapshot.categoryCounts,
+    weightedCategoryCounts: historySnapshot.weightedCategoryCounts,
     openCategoryCounts: openSnapshot.openCategoryCounts,
     focusSearchCount: countSearches(searchQueries, FOCUS_SEARCH_TERMS),
     anxiousSearchCount: countSearches(searchQueries, ANXIOUS_SEARCH_TERMS),
@@ -137,34 +140,53 @@ function summarizeOpenTabs(tabs) {
   };
 }
 
-function extractHistorySignals(items) {
+function extractHistorySignals(items, now) {
   const domainsVisited = {};
   const categoryCounts = {};
+  const weightedCategoryCounts = {};
   const searchQueries = [];
   let visitCount = 0;
+  let recentVisitCount = 0;
+  // Exponential decay: 12-minute time constant so visits ~5 min ago count ~65%,
+  // visits ~20 min ago count ~18%. Makes the orb react to what you're doing *now*.
+  const decayConstant = 12 * 60 * 1000;
+  const recentCutoff = now - 5 * 60 * 1000;
 
   for (const it of items) {
     if (!it.url || !it.url.startsWith("http")) continue;
     visitCount += 1;
+
+    const age = Math.max(0, now - (it.lastVisitTime || now));
+    const weight = Math.exp(-age / decayConstant);
+
+    if ((it.lastVisitTime || 0) > recentCutoff) recentVisitCount++;
 
     const d = safeDomain(it.url);
     if (d) {
       incrementCount(domainsVisited, d);
       const category = classifyDomain(d);
       incrementCount(categoryCounts, category);
+      weightedCategoryCounts[category] = (weightedCategoryCounts[category] || 0) + weight;
     }
 
     const q = extractSearchQuery(it.url);
     if (q) searchQueries.push(q);
   }
 
-  const topDomainEntry = Object.entries(domainsVisited).sort((a, b) => b[1] - a[1])[0];
+  const sortedDomains = Object.entries(domainsVisited).sort((a, b) => b[1] - a[1]);
+  const topDomainEntry = sortedDomains[0];
+  const topDomainCount = topDomainEntry ? topDomainEntry[1] : 0;
+  // Only compute coherence when there's enough data to be meaningful.
+  const coherenceRatio = visitCount > 3 ? topDomainCount / visitCount : 0;
 
   return {
     domainsVisited,
     categoryCounts,
+    weightedCategoryCounts,
     searchQueries,
     visitCount,
+    recentVisitCount,
+    coherenceRatio,
     uniqueDomainVisitedCount: Object.keys(domainsVisited).length,
     topDomain: topDomainEntry ? topDomainEntry[0] : null
   };
@@ -212,49 +234,70 @@ function isSearchHost(host) {
   );
 }
 
-// --- Categorization (starter mapping) ---
+// --- Categorization ---
 function classifyDomain(domain) {
   const d = domain;
 
   if (
     d.includes("nytimes.com") || d.includes("wsj.com") || d.includes("bbc.") ||
-    d.includes("cnn.com") || d.includes("reuters.com") || d.includes("bloomberg.")
+    d.includes("cnn.com") || d.includes("reuters.com") || d.includes("bloomberg.") ||
+    d.includes("theguardian.com") || d.includes("washingtonpost.com") || d.includes("apnews.com") ||
+    d.includes("techcrunch.com") || d.includes("theverge.com") || d.includes("wired.com") ||
+    d.includes("news.ycombinator.com") || d.includes("arstechnica.com")
   ) return "news";
 
   if (
     d.includes("twitter.com") || d.includes("x.com") || d.includes("instagram.com") ||
-    d.includes("tiktok.com") || d.includes("reddit.com") || d.includes("facebook.com")
+    d.includes("tiktok.com") || d.includes("reddit.com") || d.includes("facebook.com") ||
+    d.includes("linkedin.com") || d.includes("threads.net") || d.includes("bsky.app") ||
+    d.includes("mastodon.") || d.includes("tumblr.com")
   ) return "social";
 
   if (
     d.includes("youtube.com") || d.includes("netflix.com") || d.includes("twitch.tv") ||
-    d.includes("hulu.com") || d.includes("disneyplus.com") || d.includes("max.com")
+    d.includes("hulu.com") || d.includes("disneyplus.com") || d.includes("max.com") ||
+    d.includes("spotify.com") || d.includes("soundcloud.com") || d.includes("vimeo.com") ||
+    d.includes("primevideo.com") || d.includes("peacocktv.com") || d.includes("crunchyroll.com")
   ) return "video";
 
   if (
     d.includes("docs.google.com") || d.includes("notion.so") || d.includes("github.com") ||
     d.includes("stackoverflow.com") || d.includes("developer.") || d.includes("readthedocs.") ||
-    d.includes("npmjs.com") || d.includes("mdn")
+    d.includes("npmjs.com") || d.includes("mdn") || d.includes("gitlab.com") ||
+    d.includes("wikipedia.org") || d.includes("medium.com") || d.includes("substack.com") ||
+    d.includes("chatgpt.com") || d.includes("claude.ai") || d.includes("perplexity.ai") ||
+    d.includes("gemini.google.com") || d.includes("coursera.com") || d.includes("udemy.com") ||
+    d.includes("khanacademy.org") || d.includes("vercel.com") || d.includes("netlify.com") ||
+    d.includes("codepen.io") || d.includes("replit.com") || d.includes("codesandbox.io") ||
+    d.includes("atlassian.com") || d.includes("confluence.") || d.includes("pkg.go.dev")
   ) return "docsdev";
 
   if (
     d.includes("amazon.") || d.includes("ebay.") || d.includes("etsy.com") ||
-    d.includes("walmart.") || d.includes("shopify.") || d.includes("target.com")
+    d.includes("walmart.") || d.includes("shopify.") || d.includes("target.com") ||
+    d.includes("bestbuy.com") || d.includes("wayfair.com") || d.includes("chewy.com") ||
+    d.includes("newegg.com") || d.includes("aliexpress.com")
   ) return "shopping";
 
   if (
     d.includes("figma.com") || d.includes("linear.app") || d.includes("jira.") ||
     d.includes("trello.com") || d.includes("asana.com") || d.includes("airtable.com") ||
-    d.includes("calendar.google.com") || d.includes("drive.google.com")
+    d.includes("calendar.google.com") || d.includes("drive.google.com") ||
+    d.includes("clickup.com") || d.includes("monday.com") || d.includes("basecamp.com") ||
+    d.includes("miro.com") || d.includes("whimsical.com")
   ) return "productivity";
 
   if (
     d.includes("mail.google.com") || d.includes("slack.com") || d.includes("discord.com") ||
-    d.includes("teams.microsoft.com") || d.includes("zoom.us") || d.includes("meet.google.com")
+    d.includes("teams.microsoft.com") || d.includes("zoom.us") || d.includes("meet.google.com") ||
+    d.includes("outlook.") || d.includes("webex.com") || d.includes("loom.com") ||
+    d.includes("whatsapp.com") || d.includes("telegram.org")
   ) return "communication";
 
   if (
-    d.includes("mayoclinic.org") || d.includes("webmd.com") || d.includes("healthline.com")
+    d.includes("mayoclinic.org") || d.includes("webmd.com") || d.includes("healthline.com") ||
+    d.includes("nih.gov") || d.includes("cdc.gov") || d.includes("psychologytoday.com") ||
+    d.includes("drugs.com") || d.includes("medlineplus.gov")
   ) return "wellness";
 
   return "other";
@@ -284,49 +327,62 @@ function countSearches(queries, needles) {
 
 // --- Mood scoring ---
 function scoreMoods(f, previousState) {
-  const category = (name) => f.categoryCounts[name] || 0;
+  // wCategory uses recency-weighted counts so that what you did in the last
+  // few minutes matters more than activity 25 minutes ago.
+  const wCategory = (name) => f.weightedCategoryCounts[name] || 0;
   const openCategory = (name) => f.openCategoryCounts[name] || 0;
 
-  const workMix = category("docsdev") + category("productivity") + category("communication") * 0.7;
-  const stimulationMix = category("social") + category("video") + category("news");
-  const escapeMix = category("social") + category("video") + category("shopping") + f.escapeSearchCount * 1.5;
-  const worryMix = category("news") + category("wellness") + f.anxiousSearchCount * 1.8;
-  const activityLevel = clamp01((f.visitCount + f.openTabCount * 2) / 70);
+  // Weighted denominators are ~55% of raw because of exponential decay.
+  const workMix = wCategory("docsdev") + wCategory("productivity") + wCategory("communication") * 0.7;
+  const stimulationMix = wCategory("social") + wCategory("video") + wCategory("news");
+  const escapeMix = wCategory("social") + wCategory("video") + wCategory("shopping") + f.escapeSearchCount * 1.2;
+  const worryMix = wCategory("news") + wCategory("wellness") + f.anxiousSearchCount * 1.5;
+
+  // Activity based on visit rate rather than raw tab count — tab count is too static.
+  const recentBurst = clamp01(f.recentVisitCount / 8);
+  const activityLevel = clamp01((f.recentVisitCount * 2.5 + f.visitCount * 0.4) / 50);
   const switchingLoad = clamp01((f.uniqueDomainVisitedCount + f.openDomainCount) / 18);
-  const focusIntent = clamp01((workMix + f.focusSearchCount * 2 + openCategory("docsdev")) / 16);
-  const worryIntent = clamp01(worryMix / 12);
-  const escapeIntent = clamp01((escapeMix + openCategory("video") + openCategory("social")) / 16);
+
+  // Coherence: spending most of your time on one domain is a focus indicator,
+  // regardless of how much you bounced around earlier in the window.
+  const coherenceBoost = clamp01(f.coherenceRatio * 0.9);
+
+  const focusIntent = clamp01((workMix + f.focusSearchCount * 2 + openCategory("docsdev") + coherenceBoost * 4) / 10);
+  const worryIntent = clamp01(worryMix / 7);
+  const escapeIntent = clamp01((escapeMix + openCategory("video") + openCategory("social")) / 10);
   const calmReserve = clamp01(1 - activityLevel * 0.55 - switchingLoad * 0.35 - worryIntent * 0.4);
   const categorySpread = clamp01(Object.values(f.categoryCounts).filter(Boolean).length / 6);
 
   const scores = {
     Focused:
-      focusIntent * 0.5 +
+      focusIntent * 0.44 +
       clamp01(1 - escapeIntent) * 0.18 +
-      clamp01(1 - switchingLoad) * 0.16 +
+      clamp01(1 - switchingLoad) * 0.14 +
+      coherenceBoost * 0.12 +
       (isWorkCategory(f.activeCategory) ? 0.12 : 0),
     Calm:
       calmReserve * 0.5 +
-      clamp01(1 - stimulationMix / 14) * 0.2 +
+      clamp01(1 - stimulationMix / 9) * 0.2 +
       clamp01(1 - worryIntent) * 0.2 +
       clamp01(1 - categorySpread) * 0.1,
     Restless:
-      switchingLoad * 0.38 +
-      activityLevel * 0.2 +
-      categorySpread * 0.22 +
-      clamp01(stimulationMix / 14) * 0.2,
+      switchingLoad * 0.30 +
+      activityLevel * 0.18 +
+      categorySpread * 0.20 +
+      clamp01(stimulationMix / 9) * 0.20 +
+      recentBurst * 0.12,
     Anxious:
       worryIntent * 0.5 +
-      clamp01(category("news") / 8) * 0.16 +
+      clamp01(wCategory("news") / 5) * 0.16 +
       clamp01(f.anxiousSearchCount / 4) * 0.16 +
-      activityLevel * 0.1 +
+      activityLevel * 0.10 +
       (isHighAlertCategory(f.activeCategory) ? 0.08 : 0),
     Avoidant:
       escapeIntent * 0.48 +
-      clamp01(category("shopping") / 6) * 0.12 +
-      activityLevel * 0.14 +
+      clamp01(wCategory("shopping") / 4) * 0.12 +
+      activityLevel * 0.12 +
       clamp01(1 - focusIntent) * 0.16 +
-      (isEscapeCategory(f.activeCategory) ? 0.1 : 0)
+      (isEscapeCategory(f.activeCategory) ? 0.12 : 0)
   };
 
   applyPreviousMoodBias(scores, previousState);
@@ -357,7 +413,9 @@ function scoreMoods(f, previousState) {
     escapeIntent,
     switchingLoad,
     calmReserve,
-    activeCategory: f.activeCategory
+    activeCategory: f.activeCategory,
+    coherenceRatio: f.coherenceRatio,
+    topDomain: f.topDomain
   });
   const signals = buildSignals(mood, f);
 
@@ -386,15 +444,21 @@ function applyPreviousMoodBias(scores, previousState) {
 }
 
 function buildSignals(mood, f) {
+  const recentStr = f.recentVisitCount > 0 ? `, ${f.recentVisitCount} in last 5 min` : "";
   const sig = [
-    `Last ${f.windowMinutes} min: ~${Math.round(f.visitCount)} visits across ${f.uniqueDomainVisitedCount} domains`,
+    `Last ${f.windowMinutes} min: ~${Math.round(f.visitCount)} visits across ${f.uniqueDomainVisitedCount} domains${recentStr}`,
     `Open now: ${f.openTabCount} tabs across ${f.openDomainCount} domains`
   ];
+
+  if (f.coherenceRatio > 0.5 && f.topDomain) {
+    sig.push(`Deep on ${f.topDomain} (${Math.round(f.coherenceRatio * 100)}% of visits)`);
+  } else if (f.topDomain) {
+    sig.push(`Most revisited: ${f.topDomain}`);
+  }
 
   if (f.activeCategory && f.activeCategory !== "other") {
     sig.push(`Active tab leans ${labelForCategory(f.activeCategory)}`);
   }
-  if (f.topDomain) sig.push(`Most revisited: ${f.topDomain}`);
   if ((f.categoryCounts.docsdev || 0) + (f.categoryCounts.productivity || 0)) {
     sig.push(`Work-ish pages: ${(f.categoryCounts.docsdev || 0) + (f.categoryCounts.productivity || 0)}`);
   }
@@ -416,13 +480,18 @@ function buildSignals(mood, f) {
 function buildSummary(mood, context) {
   switch (mood) {
     case "Focused":
+      if (context.coherenceRatio > 0.6 && context.topDomain) {
+        return `Deep session on ${context.topDomain} — looks like sustained, deliberate work.`;
+      }
       return context.activeCategory === "docsdev" || context.activeCategory === "productivity"
         ? "Your browsing looks task-oriented and steady right now."
         : "There are more work signals than distraction signals right now.";
     case "Calm":
       return "Activity looks light and relatively settled.";
     case "Restless":
-      return "There are lots of quick context shifts and mixed inputs right now.";
+      return context.switchingLoad > 0.6
+        ? "You're jumping between a lot of different things right now."
+        : "There are lots of quick context shifts and mixed inputs right now.";
     case "Anxious":
       return "The recent pattern leans toward uncertainty-seeking or high-alert browsing.";
     case "Avoidant":
